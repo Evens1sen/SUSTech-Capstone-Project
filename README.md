@@ -1,3 +1,3 @@
-# SUSTech-Capstone-Project
+# An Anomaly Detection Platform for Urban Traffic Streaming
 
-Title: Real-time city traffic anomaly detection platform based on streaming system
+The capstone project at SUSTech
