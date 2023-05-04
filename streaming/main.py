@@ -10,23 +10,28 @@ import torch
 from DCRNN import *
 
 
-INITIAL_TIMESTAMP = '2019-02-01 00:00:00'
-INITIAL_TIMESTEP = 12  # The initial timestamp is 01:00:00
+INITIAL_TIMESTAMP = '2019-02-01 00:00:00'  # The initial timestamp of the system
+INITIAL_TIMESTEP = 12  # The initial time step is 01:00:00, marked as 12
 TIME_INTERVAL = 5  # 5 minutes time interval
 TIME_SCALE = 60  # Scale the time with 1min -> 1sec, 1hour -> 1min
+FLOW_TYPES = ['taxi_inflow', 'taxi_outflow']
+DETECT_THRESHOLD = 10
 
 current_timestep = INITIAL_TIMESTEP
 manhattan_zones = pd.read_csv("../data-NYCZones/zones/manhattan_zones.csv")
-flow_array = None
+flow_array = None  # Flow with shape (T, N, C) = (12, 69, 4)
 
 config = configparser.ConfigParser()
-config.read('capstone.ini')
+config.read('config.ini')
 es = Elasticsearch(
     cloud_id=config['ELASTIC']['cloud_id'],
     http_auth=(config['ELASTIC']['user'], config['ELASTIC']['password'])
 )
 
 
+# Read the data from a certain index
+# Full load all the data if the timestep is initial step
+# Else only load the data incrementaly for the current_timestep
 def read_from_es(index_name):
     global current_timestep
 
@@ -54,67 +59,76 @@ def read_from_es(index_name):
     return data
 
 
+# Write a pandas dataframe to ES
+# Used for writing the abnormal regions' information
 def write_to_es(index_name, data):
     # First delete all documents in the specified index
     delete_query = {"query": {"match_all": {}}}
-    es.delete_by_query(index=index_name, body=delete_query)
+    try:
+        es.delete_by_query(index=index_name, body=delete_query)
+    except:
+        Exception
 
     # Convert the DataFrame to a JSON format
     json_data = data.to_json(orient='records')
 
     # Index the documents into Elasticsearch
     for i, doc in enumerate(json.loads(json_data)):
-        es.index(index='test', document=doc)
+        es.index(index=index_name, id=i, body=doc)
 
 
 # Convert the flow data into the numpy array for model inference
-def flow_to_ndarray(flow):
-    if not flow:
+def flow_to_ndarray(flow_name, input):
+    if not input:
         return np.zeros([1, 69])
 
-    df = pd.DataFrame(flow)
+    df = pd.DataFrame(input)
 
     # Join the two tables on the zone_id column, calculate timestep
-    joined_flow_table = pd.merge(
-        df, manhattan_zones, left_on='DOLocationID', right_on='zone_id', how='left')
-    joined_flow_table = joined_flow_table.drop(
-        ['DOLocationID', 'zone_id', 'zone_name'], axis=1)
-    joined_flow_table['interval_start'] = pd.to_datetime(
-        joined_flow_table['interval_start'])
+    joined_flow_table = pd.merge(df, manhattan_zones, left_on='region_id', right_on='zone_id', how='left')
+    joined_flow_table = joined_flow_table.drop(['region_id', 'zone_id', 'zone_name'], axis=1)
+    joined_flow_table['interval_start'] = pd.to_datetime(joined_flow_table['interval_start'])
     joined_flow_table['timestep'] = ((joined_flow_table['interval_start'] -
                                      joined_flow_table['interval_start'][0]).dt.total_seconds() / 60 // TIME_INTERVAL)
 
     global current_timestep
     rows = 12 if current_timestep == INITIAL_TIMESTEP else 1
-    inflows_array = np.zeros([rows, 69])
+    flows = np.zeros([rows, 69])
     for _, row in joined_flow_table.iterrows():
         i = int(row['timestep'])
         j = int(row['graph_id'])
-        inflows_array[i][j] = row['inflow']
+        flows[i][j] = row[flow_name.split('_')[1]]
 
-    return inflows_array
+    return flows
 
 
-def load_all(index_name):
+def load_all():
     global flow_array
-    preloaded_data = read_from_es(index_name)
-    flow_array = flow_to_ndarray(preloaded_data)
+    channel = len(FLOW_TYPES)
+    flow_array = np.zeros([12, 69, channel])
+
+    for i in range(channel):
+        preloaded_data = read_from_es(FLOW_TYPES[i] + '_es')
+        flow_array[:, :, i] = flow_to_ndarray(FLOW_TYPES[i], preloaded_data)
 
 
-def load_step(index_name):
+def load_step():
     global flow_array
-    next_step_flow = read_from_es(index_name)
-    new_row = flow_to_ndarray(next_step_flow)
-    flow_array = np.delete(flow_array, 0, axis=0)
-    flow_array = np.append(flow_array, new_row, axis=0)
+    channel = len(FLOW_TYPES)
+
+    for i in range(channel):
+        next_step_flow = read_from_es(FLOW_TYPES[i] + '_es')
+        new_row = flow_to_ndarray(FLOW_TYPES[i], next_step_flow)
+        flow_array[1:, :, i] = flow_array[:-1, :, i]
+        flow_array[-1, :, i] = new_row
 
 
 # Read previous 12 timestemps from ES
-def load_es_flow(current_timestep):
+def load_flow(current_timestep):
     if current_timestep == INITIAL_TIMESTEP:
-        load_all("taxi_inflow_es")
+        load_all()
     else:
-        load_step("taxi_inflow_es")
+        load_step()
 
 
 # flow_array: nd_array with shape (T, N) = (12, 69)
@@ -124,48 +138,57 @@ def run_model(flow_array):
     np.random.seed(100)
     device = torch.device("cpu")
 
-    # The data flow of 2019-01 are scaled
-    scaler = StandardScaler()
-    scaled_flow = scaler.fit_transform(flow_array)
-
-    def get_model():
+    # Get the corresponding model for the given flow
+    def get_model(flow_name):
         adj_mx = load_adj(config['MODEL']['ADJPATH'],
                           config['MODEL']['ADJTYPE'])
         model = DCRNN(device, num_nodes=69,
                       input_dim=1, output_dim=1,
                       out_horizon=3, P=adj_mx).to(device)
+        model.load_state_dict(torch.load(
+            './pretrained/' + config['MODEL']['MODELNAME'] + '_' + flow_name + '.pt', map_location=torch.device('cpu')))
         return model
 
-    def predict(input):
-        model = get_model()
-        model.load_state_dict(torch.load(
-            config['MODEL']['MODELNAME'] + '.pt', map_location=torch.device('cpu')))
-        XS = torch.Tensor(input)
+    # Predict using the model and the input with shape (1, T, N, 1)
+    def predict(flow_name):
+        model = get_model(flow_name)
+        flow = flow_array[:, :, FLOW_TYPES.index(flow_name)]
+
+        scaler = StandardScaler()
+        scaled_input = scaler.fit_transform(flow)
+        scaled_input = scaled_input[np.newaxis, :, :, np.newaxis]
+
+        XS = torch.Tensor(scaled_input)
         with torch.no_grad():
             Y_pred = model(XS)
         Y_pred = Y_pred.cpu().numpy()
-        Y_pred = scaler.inverse_transform(np.squeeze(Y_pred))
 
+        Y_pred = scaler.inverse_transform(np.squeeze(Y_pred))
         prediction = Y_pred[0].astype(int)
         return prediction
 
-    input = scaled_flow[np.newaxis, :, :, np.newaxis]
-    result = predict(input)
-    return result
+    results = [predict(flow_name) for flow_name in FLOW_TYPES]
+    stacked_result = np.stack(results, axis=-1)
+    return stacked_result
 
 
 # Detect the abnormal regions and write the data into ES
 def detect_anomality(ground_truth, prediction):
-    diff = [abs(i - j) for i, j in zip(ground_truth, prediction)]
-    abnormal_graph_ids = [index for index, value in enumerate(diff) if value > 10]
-    abnormal_zones = manhattan_zones[manhattan_zones['graph_id'].isin(abnormal_graph_ids)]
-    
-    write_to_es("taxi_inflow", abnormal_zones)
-    raise KeyError
+    anomalies = pd.DataFrame({'zone_id': [], 'graph_id': [], 'zone_name': [], 'flow_type': []})
+
+    channel = len(FLOW_TYPES)
+    for k in range(channel):
+        diff = [abs(i - j) for i, j in zip(ground_truth[:, k], prediction[:, k])]
+        abnormal_graph_ids = [index for index, value in enumerate(diff) if value > DETECT_THRESHOLD]
+        abnormal_zones = manhattan_zones[manhattan_zones['graph_id'].isin(abnormal_graph_ids)]
+        abnormal_zones['flow_type'] = FLOW_TYPES[k]
+        anomalies = pd.concat([anomalies, abnormal_zones], ignore_index=True)
+
+    write_to_es("anomalies", anomalies)
 
 
 # Preload the initial 12 timesteps data
-load_es_flow(current_timestep)
+load_flow(current_timestep)
 
 while True:
     # print(f"Timestep: {current_timestep}")
@@ -181,7 +204,7 @@ while True:
     # Update the flow_array
     # Deleting the first row (first timestep)
     # Append a new row to the last
-    load_es_flow(current_timestep)
+    load_flow(current_timestep)
     ground_truth = flow_array[-1]
 
     # Compare the prediction with the real flow
