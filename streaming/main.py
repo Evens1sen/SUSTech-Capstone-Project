@@ -97,6 +97,8 @@ def flow_to_ndarray(flow_name, input):
     for _, row in joined_flow_table.iterrows():
         i = int(row['timestep'])
         j = int(row['graph_id'])
+        if i == 12:
+            break
         flows[i][j] = row[flow_name.split('_')[1]]
 
     return flows
