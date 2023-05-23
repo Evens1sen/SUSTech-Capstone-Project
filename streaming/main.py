@@ -97,7 +97,7 @@ def flow_to_ndarray(flow_name, input):
     for _, row in joined_flow_table.iterrows():
         i = int(row['timestep'])
         j = int(row['graph_id'])
-        if i == 12:
+        if i == rows:
             break
         flows[i][j] = row[flow_name.split('_')[1]]
 
@@ -193,8 +193,8 @@ def detect_anomality(ground_truth, prediction):
 load_flow(current_timestep)
 
 while True:
-    # print(f"Timestep: {current_timestep}")
-    # print(flow_array)
+    print(f"Timestep: {current_timestep}")
+    print(flow_array.shape)
 
     # Predict the flow for the next timestep
     prediction = run_model(flow_array)
